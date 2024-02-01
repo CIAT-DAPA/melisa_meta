@@ -21,11 +21,14 @@
 
 // Use dotenv to read .env vars into Node
 require('dotenv').config();
+const uuid = require("uuid");
 
 // Imports dependencies and set up http server
 const
     request = require('request'),
     express = require('express'),
+    FormData = require('form-data'),
+    querystring = require('querystring'),
     axios = require('axios'),
     { urlencoded, json } = require('body-parser'),
     fs = require('fs');
@@ -80,11 +83,12 @@ app.get('/webhook', (req, res) => {
         }
     }
 });
-
 // Creates the endpoint for your webhook
 app.post('/webhook', (req, res) => {
+    console.log("request: " + typeof (req))
     log_request(req);
     let body = req.body;
+    //console.log("body: " + JSON.stringify(body))
     console.log('WEBHOOK | MESSAGE | ' + JSON.stringify(body));
     // Iterates over each entry - there may be multiple if batched
 
@@ -98,12 +102,20 @@ app.post('/webhook', (req, res) => {
             user_tags = { service: "facebook" };
             // Gets the body of the webhook event
             let webhookEvent = entry.messaging[0];
+
             // Get the id sender
             senderPsid = webhookEvent.sender.id;
-            // Check if the event is a message or postback and
-            // pass the event to the appropriate handler function
-            if (webhookEvent.message && webhookEvent.message.text) {
-                message = webhookEvent.message.text;
+            // Check if the event is a message or postback
+            if (webhookEvent.message) {
+                if (webhookEvent.message.text) {
+                    message = webhookEvent.message.text;
+                } else if (webhookEvent.message.attachments && webhookEvent.message.attachments.length > 0) {
+                    // Check if the message contains an image
+                    let attachment = webhookEvent.message.attachments[0];
+                    if (attachment.type === 'image') {
+                        message = ["facebook,image", webhookEvent]
+                    }
+                }
             }
         }
         else if (body.object === 'whatsapp_business_account') {
@@ -128,6 +140,12 @@ app.post('/webhook', (req, res) => {
                 message_tags = {
                     wp_id: webhookEvent.metadata.phone_number_id
                 }
+                // Check if the message contains an image
+            } else if (webhookEvent.messages && webhookEvent.messages[0].type === "image") {
+                message = ["whatsapp,image", webhookEvent]
+                message_tags = {
+                    wp_id: webhookEvent.metadata.phone_number_id
+                }
             }
         }
         // Send
@@ -137,31 +155,266 @@ app.post('/webhook', (req, res) => {
     res.status(200).send('EVENT_RECEIVED');
 });
 
+// Función para serializar objetos anidados recursivamente
+function stringifyNested(obj, prefix = '') {
+    return Object.entries(obj).map(([key, value]) => {
+        const fullKey = prefix ? `${prefix}.${key}` : key;
+
+        if (typeof value === 'object' && value !== null) {
+            return stringifyNested(value, fullKey);
+        } else {
+            return `${encodeURIComponent(fullKey)}=${encodeURIComponent(value)}`;
+        }
+    }).join('&');
+}
 
 // Handles messages events
 function SendRequestDemeter(senderPsid, message, user_tags, message_tags) {
+    //console.log('WEBHOOK | REQUEST | ' + senderPsid + ' | ' + message + " | " + user_tags + " | " + message_tags);
 
-    console.log('WEBHOOK | REQUEST | ' + senderPsid + ' | ' + message + " | " + user_tags + " | " + message_tags);
-    // Create the payload for a basic text message, which
-    let json = {
-        melisa: conf.MELISA_NAME,
-        token: conf.TOKEN_DEMETER,
-        user: senderPsid,
-        message: message,
-        user_tags: user_tags,
-        message_tags: message_tags
+    //Handling images
+    if (message[0] && message[0].split(",")[1] === "image") {
+        handleImage(message[1], message[0].split(",")[0], user_tags, message_tags);
     }
-    request({
-        'uri': conf.DEMETER_URL,
-        'method': 'POST',
-        'json': json
-    }, (err, _res, _body) => {
-        if (!err) {
-            console.log('WEBHOOK | RESPONSE |' + _res);
-        } else {
-            console.log('WEBHOOK | ERROR |' + err);
+    else {
+        let json = {
+            melisa: conf.MELISA_NAME,
+            token: conf.TOKEN_DEMETER,
+            user: senderPsid,
+            message: message,
+            user_tags: user_tags,
+            message_tags: message_tags,
+            kind: "text"
         }
-    });
+
+        // Convierte el objeto en una cadena de consulta
+        const formBody = stringifyNested(json);
+
+
+        //Configuración de la solicitud
+        const options = {
+            uri: conf.DEMETER_URL,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: formBody,
+        };
+
+        if(json.user !='' && json.message !=''){
+            // Realiza la solicitud
+            request(options, (err, _res, _body) => {
+                if (!err) {
+                    console.log('WEBHOOK | RESPONSE | ' + _res.body);
+                } else {
+                    console.log('WEBHOOK | ERROR | ' + err);
+                }
+            });
+
+        }
+
+    }
+}
+
+// Handles images events
+function handleImage(imageData, platform, user_tags = null, message_tags = null) {
+    // Check if the platform is Facebook
+    if (platform === "facebook") {
+        // Access the image URL from the attachments
+        const image = imageData.message.attachments[0].payload.url;
+
+        // Save the image
+        const dateToday = new Date();
+        const year = dateToday.getFullYear();
+        const month = String(dateToday.getMonth() + 1).padStart(2, "0");
+        const day = String(dateToday.getDate()).padStart(2, "0");
+        const dateString = `${year}${month}${day}`;
+        // Generate a random UUID
+        const id = uuid.v4();
+        // Get image format
+        const format = image.split("?")[0].substring(image.split("?")[0].lastIndexOf(".") + 1);
+        const senderPsid = imageData.sender.id;
+        const imagePath = `.//images/${dateString}/${senderPsid}/${id}.${format}`;
+        // Create the directory if it doesn't exist
+        const directoryPath = `.//images/${dateString}/${senderPsid}`;
+        if (!fs.existsSync(directoryPath)) {
+            try {
+                fs.mkdirSync(directoryPath, { recursive: true });
+            } catch (error) {
+                console.error(error);
+            }
+        }
+
+        axios({
+            method: 'get',
+            url: image,
+            responseType: 'arraybuffer', // Set the responseType to 'arraybuffer'
+        }).then(response => {
+
+            // Write image to the directory
+            fs.writeFileSync(imagePath, response.data);
+
+            //callSendAPIFacebook(senderPsid, { 'text': "Imagen almacenada correctamente" });
+
+            const form = new FormData();
+            form.append('file', fs.createReadStream(imagePath), {
+                filename: `${id}.${format}`,
+                contentType: `image/${format}`,
+            });
+
+            const jsonData = {
+                melisa: conf.MELISA_NAME,
+                token: conf.TOKEN_DEMETER,
+                user: senderPsid,
+                message: "",
+                user_tags: user_tags,
+                message_tags: message_tags,
+                kind: "img",
+            };
+
+            // Añadir los datos JSON al FormData
+            Object.keys(jsonData).forEach(key => {
+                const value = jsonData[key];
+                if (key === "user_tags" || key === "message_tags") {
+                    // Añadir campos anidados al FormData directamente
+                    Object.keys(value).forEach(subKey => {
+                        form.append(`${key}.${subKey}`, value[subKey]);
+                    });
+                } else {
+                    form.append(key, value);
+                }
+            });
+
+
+            // Configuración de la solicitud con Axios
+            const axiosConfig = {
+                method: 'post',
+                url: conf.DEMETER_URL,
+                headers: {
+                    ...form.getHeaders(),
+                    'Content-Type': 'multipart/form-data',
+                },
+                data: form,
+            };
+
+            // Realizar la solicitud con Axios
+            axios(axiosConfig)
+                .then(response => {
+                    console.log('WEBHOOK | RESPONSE | ' + response.data);
+                })
+                .catch(error => {
+                    console.log('WEBHOOK | ERROR | ' + error);
+                })
+        });
+    } else if (platform === "whatsapp") {
+
+        // Generate a random UUID
+        const id = uuid.v4();
+        const format = "jpg"
+        const dateToday = new Date();
+        const year = dateToday.getFullYear();
+        const month = String(dateToday.getMonth() + 1).padStart(2, "0");
+        const day = String(dateToday.getDate()).padStart(2, "0");
+        const dateString = `${year}${month}${day}`;
+        const senderPsid = imageData.messages[0].from;
+
+        // Create the directory if it doesn't exist
+        const directoryPath = `.//images/${dateString}/${senderPsid}`;
+        if (!fs.existsSync(directoryPath)) {
+            try {
+                fs.mkdirSync(directoryPath, { recursive: true });
+            } catch (error) {
+                console.error(error);
+            }
+        }
+
+        const imageId = imageData.messages[0].image.id;
+        const apiUrl = `https://graph.facebook.com/v18.0/${imageId}`;
+        const accessToken = conf.PAGE_ACCESS_TOKEN2;
+
+        // Configuración de los headers con el token de autorización
+        const config = {
+            headers: {
+                Authorization: `Bearer ${accessToken}`
+            }
+        };
+        // Realizar la consulta GET a la URL con imageId como parámetro y el encabezado de autorización
+        axios.get(apiUrl, config)
+            .then(response => {
+
+                // Verificar si la respuesta contiene una propiedad 'url'
+                if (response.data.url) {
+                    // Realizar otra consulta GET a la URL proporcionada en response.data.url
+                    config.responseType = 'arraybuffer';
+                    axios.get(response.data.url, config).then(imageResponse => {
+                        // Escribe la imagen en el directorio
+                        fs.writeFileSync(`${directoryPath}/${id}.${format}`, imageResponse.data, 'binary');
+                        console.log("Imagen guardada correctamente")
+
+                        //Sending image to Demeter
+                        const form = new FormData();
+                        form.append('file', fs.createReadStream(`${directoryPath}/${id}.${format}`), {
+                            filename: `${id}.${format}`,
+                            contentType: `image/${format}`,
+                        });
+
+                        const jsonData = {
+                            melisa: conf.MELISA_NAME,
+                            token: conf.TOKEN_DEMETER,
+                            user: senderPsid,
+                            message: "",
+                            user_tags: user_tags,
+                            message_tags: message_tags,
+                            kind: "img",
+                        };
+
+                        // Añadir los datos JSON al FormData
+                        Object.keys(jsonData).forEach(key => {
+                            const value = jsonData[key];
+                            if (key === "user_tags" || key === "message_tags") {
+                                // Añadir campos anidados al FormData directamente
+                                Object.keys(value).forEach(subKey => {
+                                    form.append(`${key}.${subKey}`, value[subKey]);
+                                });
+                            } else {
+                                form.append(key, value);
+                            }
+                        });
+
+                        // Configuración de la solicitud con Axios
+                        const axiosConfig = {
+                            method: 'post',
+                            url: conf.DEMETER_URL,
+                            headers: {
+                                ...form.getHeaders(),
+                                'Content-Type': 'multipart/form-data',
+                            },
+                            data: form,
+                        };
+
+                        // Realizar la solicitud con Axios
+                        axios(axiosConfig)
+                            .then(response => {
+                                console.log('WEBHOOK | RESPONSE | ' + response.data);
+                            })
+                            .catch(error => {
+                                console.log('WEBHOOK | ERROR | ' + error);
+                            })
+                    }).catch(error => {
+                        console.error('Error al descargar la imagen:', error);
+                    });
+                } else {
+                    // No hay URL en la respuesta
+                    console.log('La respuesta no contiene una URL adicional.');
+                }
+            })
+            .catch(error => {
+                // Manejar errores aquí, por ejemplo, imprimir el error
+                console.error(error);
+            });
+
+
+    }
 }
 
 // Creates the endpoint for receptor
@@ -198,22 +451,21 @@ app.post('/receptor', (req, res) => {
 
 
 // Sends response messages via the Send API
-function callSendAPIFacebook(senderPsid, response) {
-
+function callSendAPIFacebook(senderPsid, message) {
     // Construct the message body
-    let requestBody = {
-        'recipient': {
-            'id': senderPsid
+    const response = {
+        "recipient": {
+            "id": senderPsid
         },
-        'message': response
+        "message": message
     };
 
     // Send the HTTP request to the Messenger Platform
     request({
-        'uri': 'https://graph.facebook.com/v2.6/me/messages',
-        'qs': { 'access_token': conf.PAGE_ACCESS_TOKEN },
-        'method': 'POST',
-        'json': requestBody
+        "uri": "https://graph.facebook.com/v2.6/me/messages",
+        "qs": { "access_token": conf.PAGE_ACCESS_TOKEN },
+        "method": "POST",
+        "json": response
     }, (err, _res, _body) => {
         if (!err) {
             console.log('Message sent to FACEBOOK!');
@@ -222,6 +474,8 @@ function callSendAPIFacebook(senderPsid, response) {
         }
     });
 }
+
+
 
 function callSendAPIWhatsapp(senderPsid, response, from) {
     const json = {
@@ -234,7 +488,7 @@ function callSendAPIWhatsapp(senderPsid, response, from) {
 
     request({
         'uri': 'https://graph.facebook.com/v13.0/' + from + '/messages',
-        'qs': { 'access_token': conf.PAGE_ACCESS_TOKEN },
+        'qs': { 'access_token': conf.PAGE_ACCESS_TOKEN2 },
         'method': 'POST',
         'json': json
     }, (err, _res, _body) => {
